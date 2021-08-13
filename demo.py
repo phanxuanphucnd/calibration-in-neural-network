@@ -1,87 +1,132 @@
-import fire
-import os
+import sys
+import numpy as np
+import matplotlib as mpl
+mpl.use('Agg')
+import matplotlib.pyplot as plt
+
+from scipy.special import softmax
+
 import torch
+from torch import nn, optim
+from torch.nn import functional as F
+import torch.nn.init as init
+
+import torchvision
 import torchvision as tv
-from torch.utils.data.sampler import SubsetRandomSampler
-from models import DenseNet
-from temperature_scaling import ModelWithTemperature
+import torchvision.transforms as transforms
+
+sys.path.insert(1, 'models/')
+import resnet
+import metrics
+import recalibration
+import visualization
+
+np.random.seed(0)
 
 
-def demo(data, save, depth=40, growth_rate=12, batch_size=256):
-    """
-    Applies temperature scaling to a trained model.
 
-    Takes a pretrained DenseNet-CIFAR100 model, and a validation set
-    (parameterized by indices on train set).
-    Applies temperature scaling, and saves a temperature scaled version.
-
-    NB: the "save" parameter references a DIRECTORY, not a file.
-    In that directory, there should be two files:
-    - model.pth (model state dict)
-    - valid_indices.pth (a list of indices corresponding to the validation set).
-
-    data (str) - path to directory where data should be loaded from/downloaded
-    save (str) - directory with necessary files (see above)
-    """
-    # Load model state dict
-    model_filename = os.path.join(save, 'model.pth')
-    if not os.path.exists(model_filename):
-        raise RuntimeError('Cannot find file %s to load' % model_filename)
-    state_dict = torch.load(model_filename)
-
-    # Load validation indices
-    valid_indices_filename = os.path.join(save, 'valid_indices.pth')
-    if not os.path.exists(valid_indices_filename):
-        raise RuntimeError('Cannot find file %s to load' % valid_indices_filename)
-    valid_indices = torch.load(valid_indices_filename)
-
-    # Regenerate validation set loader
-    mean = [0.5071, 0.4867, 0.4408]
-    stdv = [0.2675, 0.2565, 0.2761]
-    test_transforms = tv.transforms.Compose([
-        tv.transforms.ToTensor(),
-        tv.transforms.Normalize(mean=mean, std=stdv),
-    ])
-    valid_set = tv.datasets.CIFAR100(data, train=True, transform=test_transforms, download=True)
-    valid_loader = torch.utils.data.DataLoader(valid_set, pin_memory=True, batch_size=batch_size,
-                                               sampler=SubsetRandomSampler(valid_indices))
-
-    # Load original model
-    if (depth - 4) % 3:
-        raise Exception('Invalid depth')
-    block_config = [(depth - 4) // 6 for _ in range(3)]
-    orig_model = DenseNet(
-        growth_rate=growth_rate,
-        block_config=block_config,
-        num_classes=100
-    ).cuda()
-    orig_model.load_state_dict(state_dict)
-
-    # Now we're going to wrap the model with a decorator that adds temperature scaling
-    model = ModelWithTemperature(orig_model)
-
-    # Tune the model temperature, and save the results
-    model.set_temperature(valid_loader)
-    model_filename = os.path.join(save, 'model_with_temperature.pth')
-    torch.save(model.state_dict(), model_filename)
-    print('Temperature scaled model sved to %s' % model_filename)
-    print('Done!')
+PATH = './pretrained_models/cifar10_resnet20.pth'
+net_trained = resnet.ResNet(resnet.BasicBlock, [3, 3, 3])
+net_trained.load_state_dict(torch.load(PATH,map_location=torch.device('cpu')))
 
 
-if __name__ == '__main__':
-    """
-    Applies temperature scaling to a trained model.
+# Data transforms
 
-    Takes a pretrained DenseNet-CIFAR100 model, and a validation set
-    (parameterized by indices on train set).
-    Applies temperature scaling, and saves a temperature scaled version.
+mean = [0.5071, 0.4867, 0.4408]
+stdv = [0.2675, 0.2565, 0.2761]
 
-    NB: the "save" parameter references a DIRECTORY, not a file.
-    In that directory, there should be two files:
-    - model.pth (model state dict)
-    - valid_indices.pth (a list of indices corresponding to the validation set).
+test_transforms = tv.transforms.Compose([
+    tv.transforms.ToTensor(),
+    tv.transforms.Normalize(mean=mean, std=stdv),
+])
 
-    --data (str) - path to directory where data should be loaded from/downloaded
-    --save (str) - directory with necessary files (see above)
-    """
-    fire.Fire(demo)
+# IMPORTANT! We need to use the same validation set for temperature
+# scaling, so we're going to save the indices for later
+test_set = tv.datasets.CIFAR10(root='./data', train=False, transform=test_transforms, download=True)
+testloader = torch.utils.data.DataLoader(test_set, pin_memory=True, batch_size=4)
+
+correct = 0
+total = 0
+
+# First: collect all the logits and labels for the validation set
+logits_list = []
+labels_list = []
+
+
+with torch.no_grad():
+    for images, labels in testloader:
+        #outputs are the the raw scores!
+        logits = net_trained(images)
+        #add data to list
+        logits_list.append(logits)
+        labels_list.append(labels)
+        #convert to probabilities
+        output_probs = F.softmax(logits,dim=1)
+        #get predictions from class
+        probs, predicted = torch.max(output_probs, 1)
+        #total
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+    logits = torch.cat(logits_list)
+    labels = torch.cat(labels_list)
+
+print('Accuracy of the network on the 10000 test images: %d %%' % (
+    100 * correct / total))
+print(total)
+
+################
+#metrics
+
+ece_criterion = metrics.ECELoss()
+#Torch version
+logits_np = logits.numpy()
+labels_np = labels.numpy()
+
+#Numpy Version
+print('ECE: %f' % (ece_criterion.loss(logits_np,labels_np, 15)))
+
+softmaxes = softmax(logits_np, axis=1)
+
+print('ECE with probabilties %f' % (ece_criterion.loss(softmaxes,labels_np,15,False)))
+
+mce_criterion = metrics.MCELoss()
+print('MCE: %f' % (mce_criterion.loss(logits_np,labels_np)))
+
+oe_criterion = metrics.OELoss()
+print('OE: %f' % (oe_criterion.loss(logits_np,labels_np)))
+
+sce_criterion = metrics.SCELoss()
+print('SCE: %f' % (sce_criterion.loss(logits_np,labels_np, 15)))
+
+ace_criterion = metrics.ACELoss()
+print('ACE: %f' % (ace_criterion.loss(logits_np,labels_np,15)))
+
+tace_criterion = metrics.TACELoss()
+threshold = 0.01
+print('TACE (threshold = %f): %f' % (threshold, tace_criterion.loss(logits_np,labels_np,threshold,15)))
+
+
+
+############
+#recalibration
+
+model = recalibration.ModelWithTemperature(net_trained)
+# Tune the model temperature, and save the results
+model.set_temperature(testloader)
+
+
+############
+#visualizations
+
+conf_hist = visualization.ConfidenceHistogram()
+plt_test = conf_hist.plot(logits_np,labels_np,title="Confidence Histogram")
+plt_test.savefig('plots/conf_histogram_test.png',bbox_inches='tight')
+#plt_test.show()
+
+rel_diagram = visualization.ReliabilityDiagram()
+plt_test_2 = rel_diagram.plot(logits_np,labels_np,title="Reliability Diagram")
+plt_test_2.savefig('plots/rel_diagram_test.png',bbox_inches='tight')
+#plt_test_2.show()
+
+
